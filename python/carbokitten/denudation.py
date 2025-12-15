@@ -293,9 +293,14 @@ class PhysicalErosion:
         dx_m: float,
         boundary: Boundary,
     ) -> np.ndarray | None:
-        # Port a simplified redistribution: return None for now.
-        # (Julia physically redistributes to neighbors based on local gradients.)
-        return None
+        from .redistribution import redistribute_3x3
+
+        return redistribute_3x3(
+            denudation_mass_m=denudation_mass_m,
+            water_depth_m=water_depth_m,
+            dx_m=float(dx_m),
+            boundary=boundary,
+        )
 
 
 @dataclass(frozen=True, slots=True)

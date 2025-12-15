@@ -11,6 +11,9 @@ from .kernels import (
     advection_coef_coast,
     advection_coef_periodic,
     advection_coef_reflected,
+    advection_coef_coast_with_wave,
+    advection_coef_periodic_with_wave,
+    advection_coef_reflected_with_wave,
     ca_step_coast,
     ca_step_periodic,
     ca_step_reflected,
@@ -44,6 +47,7 @@ class ALCAPFacies:
     extinction_coefficient_m_inv: float
     saturation_intensity_w_m2: float
     diffusion_coefficient_m_myr: float
+    wave: object | None = None
     active: bool = True
 
 
@@ -149,12 +153,15 @@ class ALCAPModel:
         if input_.box.boundary is Boundary.COAST:
             self._ca_step = ca_step_coast
             self._adv_coef = advection_coef_coast
+            self._adv_coef_wave = advection_coef_coast_with_wave
         elif input_.box.boundary is Boundary.PERIODIC:
             self._ca_step = ca_step_periodic
             self._adv_coef = advection_coef_periodic
+            self._adv_coef_wave = advection_coef_periodic_with_wave
         elif input_.box.boundary is Boundary.REFLECTED:
             self._ca_step = ca_step_reflected
             self._adv_coef = advection_coef_reflected
+            self._adv_coef_wave = advection_coef_reflected_with_wave
         else:  # pragma: no cover
             raise ValueError(f"Unsupported boundary: {input_.box.boundary}")
 
@@ -255,7 +262,14 @@ class ALCAPModel:
             if d == 0.0:
                 continue
 
-            advx, advy, rct = self._adv_coef(wd, d, dx_m)
+            wave = getattr(inp.facies[f], "wave", None)
+            if wave is None:
+                advx, advy, rct = self._adv_coef(wd, d, dx_m)
+            else:
+                # wave must provide fields(wd)->(vx,vy,sx,sy)
+                vx, vy, sx, sy = wave.fields(wd)
+                advx, advy, rct = self._adv_coef_wave(wd, d, dx_m, vx, vy, sx, sy)
+
             m = max_dt(advx, advy, dx_m, courant_max=2.0)
             steps = int(math.ceil(dt_myr / m))
             if steps < 1:

@@ -328,6 +328,51 @@ def advection_coef_coast(
 
 
 @njit(cache=True)
+def advection_coef_coast_with_wave(
+    w_m: np.ndarray,
+    diffusivity_m_myr: float,
+    dx_m: float,
+    wave_vx: np.ndarray,
+    wave_vy: np.ndarray,
+    wave_sx: np.ndarray,
+    wave_sy: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute adv and rct for COAST boundary, including wave velocity and shear.
+
+    Mirrors Julia `advection_coef!`:
+      adv = d * dw + v
+      rct = dot(s, dw) - d * ddw
+    """
+
+    nx, ny = w_m.shape
+    advx = np.empty((nx, ny), dtype=np.float64)
+    advy = np.empty((nx, ny), dtype=np.float64)
+    rct = np.empty((nx, ny), dtype=np.float64)
+
+    for x in range(nx):
+        for y in range(ny):
+            x1, y1 = _idx_coast(x - 1, y, nx, ny)
+            x2, y2 = _idx_coast(x + 1, y, nx, ny)
+            wx1 = w_m[x1, y1]
+            wx2 = w_m[x2, y2]
+
+            x1, y1 = _idx_coast(x, y - 1, nx, ny)
+            x2, y2 = _idx_coast(x, y + 1, nx, ny)
+            wy1 = w_m[x1, y1]
+            wy2 = w_m[x2, y2]
+
+            dwx = (wx2 - wx1) / (2.0 * dx_m)
+            dwy = (wy2 - wy1) / (2.0 * dx_m)
+            ddw = (wx1 + wx2 + wy1 + wy2 - 4.0 * w_m[x, y]) / (dx_m * dx_m)
+
+            advx[x, y] = diffusivity_m_myr * dwx + wave_vx[x, y]
+            advy[x, y] = diffusivity_m_myr * dwy + wave_vy[x, y]
+            rct[x, y] = wave_sx[x, y] * dwx + wave_sy[x, y] * dwy - diffusivity_m_myr * ddw
+
+    return advx, advy, rct
+
+
+@njit(cache=True)
 def advection_coef_periodic(
     w_m: np.ndarray,
     diffusivity_m_myr: float,
@@ -364,6 +409,46 @@ def advection_coef_periodic(
 
 
 @njit(cache=True)
+def advection_coef_periodic_with_wave(
+    w_m: np.ndarray,
+    diffusivity_m_myr: float,
+    dx_m: float,
+    wave_vx: np.ndarray,
+    wave_vy: np.ndarray,
+    wave_sx: np.ndarray,
+    wave_sy: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute adv and rct for PERIODIC boundary, including wave velocity and shear."""
+
+    nx, ny = w_m.shape
+    advx = np.empty((nx, ny), dtype=np.float64)
+    advy = np.empty((nx, ny), dtype=np.float64)
+    rct = np.empty((nx, ny), dtype=np.float64)
+
+    for x in range(nx):
+        for y in range(ny):
+            x1, y1 = _idx_periodic(x - 1, y, nx, ny)
+            x2, y2 = _idx_periodic(x + 1, y, nx, ny)
+            wx1 = w_m[x1, y1]
+            wx2 = w_m[x2, y2]
+
+            x1, y1 = _idx_periodic(x, y - 1, nx, ny)
+            x2, y2 = _idx_periodic(x, y + 1, nx, ny)
+            wy1 = w_m[x1, y1]
+            wy2 = w_m[x2, y2]
+
+            dwx = (wx2 - wx1) / (2.0 * dx_m)
+            dwy = (wy2 - wy1) / (2.0 * dx_m)
+            ddw = (wx1 + wx2 + wy1 + wy2 - 4.0 * w_m[x, y]) / (dx_m * dx_m)
+
+            advx[x, y] = diffusivity_m_myr * dwx + wave_vx[x, y]
+            advy[x, y] = diffusivity_m_myr * dwy + wave_vy[x, y]
+            rct[x, y] = wave_sx[x, y] * dwx + wave_sy[x, y] * dwy - diffusivity_m_myr * ddw
+
+    return advx, advy, rct
+
+
+@njit(cache=True)
 def advection_coef_reflected(
     w_m: np.ndarray,
     diffusivity_m_myr: float,
@@ -395,6 +480,46 @@ def advection_coef_reflected(
             advx[x, y] = diffusivity_m_myr * dwx
             advy[x, y] = diffusivity_m_myr * dwy
             rct[x, y] = -diffusivity_m_myr * ddw
+
+    return advx, advy, rct
+
+
+@njit(cache=True)
+def advection_coef_reflected_with_wave(
+    w_m: np.ndarray,
+    diffusivity_m_myr: float,
+    dx_m: float,
+    wave_vx: np.ndarray,
+    wave_vy: np.ndarray,
+    wave_sx: np.ndarray,
+    wave_sy: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute adv and rct for REFLECTED boundary, including wave velocity and shear."""
+
+    nx, ny = w_m.shape
+    advx = np.empty((nx, ny), dtype=np.float64)
+    advy = np.empty((nx, ny), dtype=np.float64)
+    rct = np.empty((nx, ny), dtype=np.float64)
+
+    for x in range(nx):
+        for y in range(ny):
+            x1, y1 = _idx_reflected(x - 1, y, nx, ny)
+            x2, y2 = _idx_reflected(x + 1, y, nx, ny)
+            wx1 = w_m[x1, y1]
+            wx2 = w_m[x2, y2]
+
+            x1, y1 = _idx_reflected(x, y - 1, nx, ny)
+            x2, y2 = _idx_reflected(x, y + 1, nx, ny)
+            wy1 = w_m[x1, y1]
+            wy2 = w_m[x2, y2]
+
+            dwx = (wx2 - wx1) / (2.0 * dx_m)
+            dwy = (wy2 - wy1) / (2.0 * dx_m)
+            ddw = (wx1 + wx2 + wy1 + wy2 - 4.0 * w_m[x, y]) / (dx_m * dx_m)
+
+            advx[x, y] = diffusivity_m_myr * dwx + wave_vx[x, y]
+            advy[x, y] = diffusivity_m_myr * dwy + wave_vy[x, y]
+            rct[x, y] = wave_sx[x, y] * dwx + wave_sy[x, y] * dwy - diffusivity_m_myr * ddw
 
     return advx, advy, rct
 

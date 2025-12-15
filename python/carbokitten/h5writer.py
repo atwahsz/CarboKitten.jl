@@ -56,11 +56,17 @@ def create_h5_output(
     fid = h5py.File(filename, "w")
     fid.require_group("input")
 
-    # Minimal header; callers can add more datasets/attrs under input/.
-    fid.attrs["tag"] = tag
-    fid["input"].create_dataset("x_m", data=np.asarray(x_m, dtype=np.float64))
-    fid["input"].create_dataset("y_m", data=np.asarray(y_m, dtype=np.float64))
-    fid["input"].create_dataset("t_myr", data=np.asarray(t_myr, dtype=np.float64))
+    # Header close to Julia H5Writer:
+    # - store axes under input/x, input/y, input/t (in SI floats)
+    # - store metadata in input attributes/datasets
+    fid["input"].create_dataset("x", data=np.asarray(x_m, dtype=np.float64))
+    fid["input"].create_dataset("y", data=np.asarray(y_m, dtype=np.float64))
+    fid["input"].create_dataset("t", data=np.asarray(t_myr, dtype=np.float64))
+
+    # Attributes that Julia writes via various components:
+    fid["input"].attrs["tag"] = tag
+    fid["input"].attrs["n_facies"] = int(n_facies)
+    fid["input"].attrs["time_steps"] = int(steps)
 
     out = H5Output(fid=fid, n_facies=n_facies, grid_size=grid_size)
 
