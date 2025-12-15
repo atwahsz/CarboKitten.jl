@@ -23,6 +23,20 @@ def _idx_coast(ix: int, iy: int, nx: int, ny: int) -> tuple[int, int]:
 
 
 @njit(cache=True)
+def _idx_periodic(ix: int, iy: int, nx: int, ny: int) -> tuple[int, int]:
+    """PERIODIC boundary: periodic x and y."""
+
+    return ix % nx, iy % ny
+
+
+@njit(cache=True)
+def _idx_reflected(ix: int, iy: int, nx: int, ny: int) -> tuple[int, int]:
+    """REFLECTED boundary: reflected x and y."""
+
+    return _reflect_index(ix, nx), _reflect_index(iy, ny)
+
+
+@njit(cache=True)
 def ca_step_coast(
     ca: np.ndarray,
     viability_lo: np.ndarray,
@@ -59,6 +73,98 @@ def ca_step_coast(
             for dx in range(-2, 3):
                 for dy in range(-2, 3):
                     ix, iy = _idx_coast(x + dx, y + dy, nx, ny)
+                    f = ca[ix, iy]
+                    if 0 <= f <= n_facies:
+                        counts[f] += 1
+
+            if cell == 0:
+                chosen = 0
+                for k in range(priority.size):
+                    f = priority[k]
+                    n = counts[f]
+                    a = activation_lo[f]
+                    b = activation_hi[f]
+                    if a <= n <= b:
+                        chosen = f
+                        break
+                out[x, y] = chosen
+            else:
+                n = counts[cell] - 1
+                a = viability_lo[cell]
+                b = viability_hi[cell]
+                out[x, y] = cell if (a <= n <= b) else 0
+
+    return out
+
+
+@njit(cache=True)
+def ca_step_periodic(
+    ca: np.ndarray,
+    viability_lo: np.ndarray,
+    viability_hi: np.ndarray,
+    activation_lo: np.ndarray,
+    activation_hi: np.ndarray,
+    priority: np.ndarray,
+) -> np.ndarray:
+    """Apply the 5x5 CA stencil once (PERIODIC boundary)."""
+
+    nx, ny = ca.shape
+    out = np.empty_like(ca)
+
+    for x in range(nx):
+        for y in range(ny):
+            cell = ca[x, y]
+            n_facies = viability_lo.shape[0] - 1
+            counts = np.zeros(n_facies + 1, dtype=np.int32)
+            for dx in range(-2, 3):
+                for dy in range(-2, 3):
+                    ix, iy = _idx_periodic(x + dx, y + dy, nx, ny)
+                    f = ca[ix, iy]
+                    if 0 <= f <= n_facies:
+                        counts[f] += 1
+
+            if cell == 0:
+                chosen = 0
+                for k in range(priority.size):
+                    f = priority[k]
+                    n = counts[f]
+                    a = activation_lo[f]
+                    b = activation_hi[f]
+                    if a <= n <= b:
+                        chosen = f
+                        break
+                out[x, y] = chosen
+            else:
+                n = counts[cell] - 1
+                a = viability_lo[cell]
+                b = viability_hi[cell]
+                out[x, y] = cell if (a <= n <= b) else 0
+
+    return out
+
+
+@njit(cache=True)
+def ca_step_reflected(
+    ca: np.ndarray,
+    viability_lo: np.ndarray,
+    viability_hi: np.ndarray,
+    activation_lo: np.ndarray,
+    activation_hi: np.ndarray,
+    priority: np.ndarray,
+) -> np.ndarray:
+    """Apply the 5x5 CA stencil once (REFLECTED boundary)."""
+
+    nx, ny = ca.shape
+    out = np.empty_like(ca)
+
+    for x in range(nx):
+        for y in range(ny):
+            cell = ca[x, y]
+            n_facies = viability_lo.shape[0] - 1
+            counts = np.zeros(n_facies + 1, dtype=np.int32)
+            for dx in range(-2, 3):
+                for dy in range(-2, 3):
+                    ix, iy = _idx_reflected(x + dx, y + dy, nx, ny)
                     f = ca[ix, iy]
                     if 0 <= f <= n_facies:
                         counts[f] += 1
@@ -127,6 +233,43 @@ def production_ca_gated(
 
 
 @njit(cache=True)
+def production_uniform(
+    water_depth_m: np.ndarray,
+    insolation_w_m2: float,
+    dt_myr: float,
+    max_growth_m_myr: np.ndarray,
+    extinction_m_inv: np.ndarray,
+    saturation_w_m2: np.ndarray,
+) -> np.ndarray:
+    """Compute capped production for all facies everywhere (no CA gating).
+
+    Returns
+    - production_m: (n_facies, nx, ny)
+    """
+
+    nx, ny = water_depth_m.shape
+    n_f = max_growth_m_myr.size
+    out = np.zeros((n_f, nx, ny), dtype=np.float64)
+
+    for x in range(nx):
+        for y in range(ny):
+            wd = water_depth_m[x, y]
+            if wd <= 0.0:
+                continue
+            for f in range(n_f):
+                I = insolation_w_m2 / saturation_w_m2[f]
+                xdep = wd * extinction_m_inv[f]
+                rate = max_growth_m_myr[f] * math.tanh(I * math.exp(-xdep))
+                p = rate * dt_myr
+                if p < 0.0:
+                    p = 0.0
+                if p > wd:
+                    p = wd
+                out[f, x, y] = p
+    return out
+
+
+@njit(cache=True)
 def water_depth(
     t_myr: float,
     sea_level_m: float,
@@ -170,6 +313,78 @@ def advection_coef_coast(
 
             x1, y1 = _idx_coast(x, y - 1, nx, ny)
             x2, y2 = _idx_coast(x, y + 1, nx, ny)
+            wy1 = w_m[x1, y1]
+            wy2 = w_m[x2, y2]
+
+            dwx = (wx2 - wx1) / (2.0 * dx_m)
+            dwy = (wy2 - wy1) / (2.0 * dx_m)
+            ddw = (wx1 + wx2 + wy1 + wy2 - 4.0 * w_m[x, y]) / (dx_m * dx_m)
+
+            advx[x, y] = diffusivity_m_myr * dwx
+            advy[x, y] = diffusivity_m_myr * dwy
+            rct[x, y] = -diffusivity_m_myr * ddw
+
+    return advx, advy, rct
+
+
+@njit(cache=True)
+def advection_coef_periodic(
+    w_m: np.ndarray,
+    diffusivity_m_myr: float,
+    dx_m: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute adv and rct (PERIODIC boundary)."""
+
+    nx, ny = w_m.shape
+    advx = np.empty((nx, ny), dtype=np.float64)
+    advy = np.empty((nx, ny), dtype=np.float64)
+    rct = np.empty((nx, ny), dtype=np.float64)
+
+    for x in range(nx):
+        for y in range(ny):
+            x1, y1 = _idx_periodic(x - 1, y, nx, ny)
+            x2, y2 = _idx_periodic(x + 1, y, nx, ny)
+            wx1 = w_m[x1, y1]
+            wx2 = w_m[x2, y2]
+
+            x1, y1 = _idx_periodic(x, y - 1, nx, ny)
+            x2, y2 = _idx_periodic(x, y + 1, nx, ny)
+            wy1 = w_m[x1, y1]
+            wy2 = w_m[x2, y2]
+
+            dwx = (wx2 - wx1) / (2.0 * dx_m)
+            dwy = (wy2 - wy1) / (2.0 * dx_m)
+            ddw = (wx1 + wx2 + wy1 + wy2 - 4.0 * w_m[x, y]) / (dx_m * dx_m)
+
+            advx[x, y] = diffusivity_m_myr * dwx
+            advy[x, y] = diffusivity_m_myr * dwy
+            rct[x, y] = -diffusivity_m_myr * ddw
+
+    return advx, advy, rct
+
+
+@njit(cache=True)
+def advection_coef_reflected(
+    w_m: np.ndarray,
+    diffusivity_m_myr: float,
+    dx_m: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute adv and rct (REFLECTED boundary)."""
+
+    nx, ny = w_m.shape
+    advx = np.empty((nx, ny), dtype=np.float64)
+    advy = np.empty((nx, ny), dtype=np.float64)
+    rct = np.empty((nx, ny), dtype=np.float64)
+
+    for x in range(nx):
+        for y in range(ny):
+            x1, y1 = _idx_reflected(x - 1, y, nx, ny)
+            x2, y2 = _idx_reflected(x + 1, y, nx, ny)
+            wx1 = w_m[x1, y1]
+            wx2 = w_m[x2, y2]
+
+            x1, y1 = _idx_reflected(x, y - 1, nx, ny)
+            x2, y2 = _idx_reflected(x, y + 1, nx, ny)
             wy1 = w_m[x1, y1]
             wy2 = w_m[x2, y2]
 
@@ -235,6 +450,70 @@ def transport_dC_coast(
 
             dC[x, y] = rct[x, y] * C[x, y] - adv_term_x - adv_term_y
 
+    return dC
+
+
+@njit(cache=True)
+def transport_dC_periodic(
+    advx: np.ndarray,
+    advy: np.ndarray,
+    rct: np.ndarray,
+    C: np.ndarray,
+    dx_m: float,
+    dC: np.ndarray,
+) -> np.ndarray:
+    nx, ny = C.shape
+    for x in range(nx):
+        for y in range(ny):
+            vx = advx[x, y]
+            if vx < 0.0:
+                x2, y2 = _idx_periodic(x + 1, y, nx, ny)
+                adv_term_x = vx * (C[x2, y2] - C[x, y]) / dx_m
+            else:
+                x1, y1 = _idx_periodic(x - 1, y, nx, ny)
+                adv_term_x = vx * (C[x, y] - C[x1, y1]) / dx_m
+
+            vy = advy[x, y]
+            if vy < 0.0:
+                x2, y2 = _idx_periodic(x, y + 1, nx, ny)
+                adv_term_y = vy * (C[x2, y2] - C[x, y]) / dx_m
+            else:
+                x1, y1 = _idx_periodic(x, y - 1, nx, ny)
+                adv_term_y = vy * (C[x, y] - C[x1, y1]) / dx_m
+
+            dC[x, y] = rct[x, y] * C[x, y] - adv_term_x - adv_term_y
+    return dC
+
+
+@njit(cache=True)
+def transport_dC_reflected(
+    advx: np.ndarray,
+    advy: np.ndarray,
+    rct: np.ndarray,
+    C: np.ndarray,
+    dx_m: float,
+    dC: np.ndarray,
+) -> np.ndarray:
+    nx, ny = C.shape
+    for x in range(nx):
+        for y in range(ny):
+            vx = advx[x, y]
+            if vx < 0.0:
+                x2, y2 = _idx_reflected(x + 1, y, nx, ny)
+                adv_term_x = vx * (C[x2, y2] - C[x, y]) / dx_m
+            else:
+                x1, y1 = _idx_reflected(x - 1, y, nx, ny)
+                adv_term_x = vx * (C[x, y] - C[x1, y1]) / dx_m
+
+            vy = advy[x, y]
+            if vy < 0.0:
+                x2, y2 = _idx_reflected(x, y + 1, nx, ny)
+                adv_term_y = vy * (C[x2, y2] - C[x, y]) / dx_m
+            else:
+                x1, y1 = _idx_reflected(x, y - 1, nx, ny)
+                adv_term_y = vy * (C[x, y] - C[x1, y1]) / dx_m
+
+            dC[x, y] = rct[x, y] * C[x, y] - adv_term_x - adv_term_y
     return dC
 
 

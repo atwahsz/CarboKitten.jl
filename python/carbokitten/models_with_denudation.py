@@ -6,7 +6,8 @@ from typing import Callable
 
 import numpy as np
 
-from .box import Box, Boundary
+from .box import Boundary, Box
+from .denudation import DenudationFacies, DenudationModel, slope_degrees
 from .kernels import (
     advection_coef_coast,
     advection_coef_periodic,
@@ -24,19 +25,8 @@ from .time import TimeProperties
 
 
 @dataclass(frozen=True, slots=True)
-class ALCAPFacies:
-    """ALCAP facies parameters (merged from Julia mixins).
-
-    Units
-    - diffusion_coefficient_m_myr: meters per mega-year (m/Myr)
-    - maximum_growth_rate_m_myr: meters per mega-year (m/Myr)
-    - extinction_coefficient_m_inv: 1/meters (m^-1)
-    - saturation_intensity_w_m2: W/m^2
-
-    CA parameters
-    - viability_range: (low, high) neighbor counts in a 5x5 window excluding center
-    - activation_range: (low, high) neighbor counts in a 5x5 window including center
-    """
+class WithDenudationFacies(DenudationFacies):
+    """Facies parameters required for WithDenudation (subset of Julia mixins)."""
 
     viability_range: tuple[int, int]
     activation_range: tuple[int, int]
@@ -52,23 +42,12 @@ InitialTopoFn = Callable[[float, float], float]
 
 
 @dataclass(frozen=True, slots=True)
-class ALCAPInput:
-    """Configuration for the ALCAP model.
-
-    Units
-    - sea_level(t): meters
-    - initial_topography(x, y): meters
-    - subsidence_rate_m_myr: m/Myr
-    - disintegration_rate_m_myr: m/Myr
-    - intertidal_zone_m: meters
-    - depositional_resolution_m: meters
-    - insolation_w_m2: W/m^2
-    """
-
+class WithDenudationInput:
     tag: str
     box: Box
     time: TimeProperties
-    facies: tuple[ALCAPFacies, ...]
+    facies: tuple[WithDenudationFacies, ...]
+    denudation: DenudationModel
 
     ca_interval: int = 1
     ca_random_seed: int = 0
@@ -87,39 +66,42 @@ class ALCAPInput:
 
 
 @dataclass(slots=True)
-class ALCAPState:
+class WithDenudationState:
     step: int
-    sediment_height_m: np.ndarray  # (nx, ny)
-    sediment_buffer: np.ndarray  # (stack, n_f, nx, ny) in stack units
-    active_layer_m: np.ndarray  # (n_f, nx, ny)
-    ca: np.ndarray  # (nx, ny) int32
-    ca_priority: np.ndarray  # (n_active,) int32
+    sediment_height_m: np.ndarray
+    sediment_buffer: np.ndarray
+    ca: np.ndarray
+    ca_priority: np.ndarray
 
 
 @dataclass(frozen=True, slots=True)
-class ALCAPFrame:
+class WithDenudationFrame:
     production_m: np.ndarray
     disintegration_m: np.ndarray
     deposition_m: np.ndarray
 
 
-class ALCAPModel:
-    """Runnable ALCAP model instance."""
+class WithDenudationModel:
+    """Runnable model port of Julia `Models/WithDenudation.jl`.
 
-    def __init__(self, input_: ALCAPInput):
+    Notes
+    - This first port keeps the same structure but currently uses the same
+      transport kernel as ALCAP (diffusion-only wave velocity).
+    - Redistribution for PhysicalErosion is left as a TODO (currently None).
+    """
+
+    def __init__(self, input_: WithDenudationInput):
         self.input = input_
         self.steps = input_.time.steps
 
         self._eta0_m = self._initial_topography_grid()
 
-        # pre-pack facies parameters into arrays for kernels
         n_f = len(input_.facies)
         self._max_growth = np.array([f.maximum_growth_rate_m_myr for f in input_.facies], dtype=np.float64)
         self._extinction = np.array([f.extinction_coefficient_m_inv for f in input_.facies], dtype=np.float64)
         self._saturation = np.array([f.saturation_intensity_w_m2 for f in input_.facies], dtype=np.float64)
         self._diffusivity = np.array([f.diffusion_coefficient_m_myr for f in input_.facies], dtype=np.float64)
 
-        # CA ranges are 1-based indexed (0 is "no facies")
         self._viability_lo = np.zeros(n_f + 1, dtype=np.int32)
         self._viability_hi = np.zeros(n_f + 1, dtype=np.int32)
         self._activation_lo = np.zeros(n_f + 1, dtype=np.int32)
@@ -134,7 +116,6 @@ class ALCAPModel:
                 active_ids.append(i)
         self._active_ids = np.array(active_ids, dtype=np.int32)
 
-        # RK4 work arrays (reused)
         nx, ny = input_.box.grid_size
         self._k1 = np.empty((nx, ny), dtype=np.float64)
         self._k2 = np.empty((nx, ny), dtype=np.float64)
@@ -142,10 +123,8 @@ class ALCAPModel:
         self._k4 = np.empty((nx, ny), dtype=np.float64)
         self._tmp = np.empty((nx, ny), dtype=np.float64)
 
-        # Disintegration output reuse
         self._pop_out = np.empty((n_f, nx, ny), dtype=np.float64)
 
-        # Boundary-specific kernels
         if input_.box.boundary is Boundary.COAST:
             self._ca_step = ca_step_coast
             self._adv_coef = advection_coef_coast
@@ -167,7 +146,12 @@ class ALCAPModel:
                 eta0[i, j] = float(self.input.initial_topography(float(x[i]), float(y[j])))
         return eta0
 
-    def initial_state(self) -> ALCAPState:
+    def _rotate_priority(self, p: np.ndarray) -> np.ndarray:
+        if p.size == 0:
+            return p
+        return np.roll(p, 1)
+
+    def initial_state(self) -> WithDenudationState:
         inp = self.input
         nx, ny = inp.box.grid_size
         n_f = len(inp.facies)
@@ -175,49 +159,30 @@ class ALCAPModel:
         rng = np.random.default_rng(inp.ca_random_seed)
         choices = np.concatenate((np.array([0], dtype=np.int32), self._active_ids))
         ca = rng.choice(choices, size=(nx, ny)).astype(np.int32, copy=False)
-
-        # priority starts as active_ids and rotates each step
         ca_priority = self._active_ids.copy()
 
-        sediment_height_m = np.zeros((nx, ny), dtype=np.float64)
-        sediment_buffer = np.zeros((inp.sediment_buffer_size, n_f, nx, ny), dtype=np.float64)
-        active_layer_m = np.zeros((n_f, nx, ny), dtype=np.float64)
-
-        state = ALCAPState(
+        st = WithDenudationState(
             step=0,
-            sediment_height_m=sediment_height_m,
-            sediment_buffer=sediment_buffer,
-            active_layer_m=active_layer_m,
+            sediment_height_m=np.zeros((nx, ny), dtype=np.float64),
+            sediment_buffer=np.zeros((inp.sediment_buffer_size, n_f, nx, ny), dtype=np.float64),
             ca=ca,
             ca_priority=ca_priority,
         )
 
-        # Julia ALCAP does 20 warmup CA steps
         for _ in range(20):
-            state = self._step_ca(state)
+            st.ca = self._ca_step(
+                st.ca,
+                self._viability_lo,
+                self._viability_hi,
+                self._activation_lo,
+                self._activation_hi,
+                st.ca_priority,
+            )
+            st.ca_priority = self._rotate_priority(st.ca_priority)
 
-        # Initial sediment is zero in the example; hook left here for parity.
-        return state
+        return st
 
-    def _rotate_priority(self, p: np.ndarray) -> np.ndarray:
-        if p.size == 0:
-            return p
-        return np.roll(p, 1)
-
-    def _step_ca(self, state: ALCAPState) -> ALCAPState:
-        nxt = self._ca_step(
-            state.ca,
-            self._viability_lo,
-            self._viability_hi,
-            self._activation_lo,
-            self._activation_hi,
-            state.ca_priority,
-        )
-        state.ca = nxt
-        state.ca_priority = self._rotate_priority(state.ca_priority)
-        return state
-
-    def _water_depth(self, state: ALCAPState) -> np.ndarray:
+    def _water_depth(self, state: WithDenudationState) -> np.ndarray:
         inp = self.input
         t = inp.time.time_myr(state.step)
         sl = float(inp.sea_level(t))
@@ -230,7 +195,7 @@ class ALCAPModel:
             sediment_height_m=state.sediment_height_m,
         )
 
-    def _disintegrate(self, state: ALCAPState, wd_m: np.ndarray) -> np.ndarray:
+    def _disintegrate(self, state: WithDenudationState, wd_m: np.ndarray) -> np.ndarray:
         inp = self.input
         max_h_m = float(inp.disintegration_rate_m_myr) * float(inp.time.dt_myr)
 
@@ -244,17 +209,19 @@ class ALCAPModel:
         pop_sediment(state.sediment_buffer, amount_units, self._pop_out)
         return self._pop_out * float(inp.depositional_resolution_m)
 
-    def _transport(self, state: ALCAPState, wd_m: np.ndarray) -> None:
+    def _transport(self, active_layer_m: np.ndarray, wd_m: np.ndarray, step: int) -> np.ndarray:
         inp = self.input
         dx_m = float(inp.box.phys_scale_m)
         dt_myr = float(inp.time.dt_myr)
         wd = wd_m + float(inp.intertidal_zone_m)
 
+        # transported sediment starts as the local active layer
+        sediment = active_layer_m.copy()
+
         for f in range(len(inp.facies)):
             d = float(self._diffusivity[f])
             if d == 0.0:
                 continue
-
             advx, advy, rct = self._adv_coef(wd, d, dx_m)
             m = max_dt(advx, advy, dx_m, courant_max=2.0)
             steps = int(math.ceil(dt_myr / m))
@@ -262,8 +229,8 @@ class ALCAPModel:
                 steps = 1
             subdt = dt_myr / float(steps)
 
-            C = state.active_layer_m[f, :, :]
-            t = inp.time.time_myr(state.step)
+            C = sediment[f, :, :]
+            t = inp.time.time_myr(step)
             for _ in range(steps):
                 rk4_step_transport(
                     advx,
@@ -280,13 +247,24 @@ class ALCAPModel:
                     tmp=self._tmp,
                 )
 
-    def step(self, state: ALCAPState) -> tuple[ALCAPState, ALCAPFrame]:
+        return sediment
+
+    def step(self, state: WithDenudationState) -> tuple[WithDenudationState, WithDenudationFrame]:
         inp = self.input
 
         if state.step % int(inp.ca_interval) == 0:
-            state = self._step_ca(state)
+            state.ca = self._ca_step(
+                state.ca,
+                self._viability_lo,
+                self._viability_hi,
+                self._activation_lo,
+                self._activation_hi,
+                state.ca_priority,
+            )
+            state.ca_priority = self._rotate_priority(state.ca_priority)
 
         wd = self._water_depth(state)
+        slope = slope_degrees(wd, dx_m=float(inp.box.phys_scale_m), boundary=inp.box.boundary)
 
         p = production_ca_gated(
             state.ca,
@@ -299,17 +277,39 @@ class ALCAPModel:
         )
 
         d = self._disintegrate(state, wd)
+        active_layer = p + d
 
-        state.active_layer_m += p
-        state.active_layer_m += d
+        sediment = self._transport(active_layer, wd, step=state.step)
 
-        self._transport(state, wd)
+        # subaerial denudation
+        den_rate = inp.denudation.denudation_rate_m_myr(
+            ca=state.ca,
+            water_depth_m=wd,
+            slope_deg=slope,
+            facies_params=inp.facies,
+        )
 
-        # deposit
-        deposit = state.active_layer_m.copy()
-        push_sediment(state.sediment_buffer, deposit / float(inp.depositional_resolution_m))
-        state.active_layer_m -= deposit
-        state.sediment_height_m += deposit.sum(axis=0)
+        if den_rate is not None:
+            den_mass = den_rate * float(inp.time.dt_myr)
+            # total mass per cell capped by available sediment height
+            den_mass_cell = np.minimum(den_mass.sum(axis=0), state.sediment_height_m)
+            state.sediment_height_m -= den_mass_cell
+
+            amount_units = den_mass_cell / float(inp.depositional_resolution_m)
+            pop_sediment(state.sediment_buffer, amount_units, self._pop_out)
+            d = d + self._pop_out * float(inp.depositional_resolution_m)
+
+            redist = inp.denudation.redistribution_m(
+                denudation_mass_m=self._pop_out * float(inp.depositional_resolution_m),
+                water_depth_m=wd,
+                dx_m=float(inp.box.phys_scale_m),
+                boundary=inp.box.boundary,
+            )
+            if redist is not None:
+                sediment = sediment + redist
+
+        push_sediment(state.sediment_buffer, sediment / float(inp.depositional_resolution_m))
+        state.sediment_height_m += sediment.sum(axis=0)
 
         state.step += 1
-        return state, ALCAPFrame(production_m=p, disintegration_m=d, deposition_m=deposit)
+        return state, WithDenudationFrame(production_m=p, disintegration_m=d, deposition_m=sediment)

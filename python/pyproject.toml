@@ -7,6 +7,7 @@ readme = "README.md"
 dependencies = [
   "numpy>=1.23",
   "numba>=0.58",
+  "h5py>=3.10",
 ]
 
 [build-system]

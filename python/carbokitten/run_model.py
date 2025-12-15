@@ -48,3 +48,28 @@ def run_model(model: Model[S], *, callback: Callable[[int, object], None] | None
         if callback is not None:
             callback(w, frame)
     return state
+
+
+def run_model_with_writers(
+    model: Model[S],
+    *,
+    state_writer: Callable[[int, S], None] | None = None,
+    frame_writer: Callable[[int, object], None] | None = None,
+) -> S:
+    """Run a model and write both state and per-step frames.
+
+    This mirrors the Julia pattern where output writers receive both the evolving
+    state and the per-step `Frame` values.
+    """
+
+    state = model.initial_state()
+    if state_writer is not None:
+        state_writer(1, state)
+
+    for w in range(1, model.steps + 1):
+        state, frame = model.step(state)
+        if frame_writer is not None:
+            frame_writer(w, frame)
+        if state_writer is not None:
+            state_writer(w + 1, state)
+    return state
